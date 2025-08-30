@@ -1,0 +1,209 @@
+version: "3.8"
+
+services:
+    # RabbitMQ Message Broker
+    rabbitmq:
+        image: rabbitmq:4-management
+        container_name: nanometrics-rabbitmq
+        ports:
+            - "5672:5672" # AMQP port
+            - "15672:15672" # Management UI
+        environment:
+            RABBITMQ_DEFAULT_USER: admin
+            RABBITMQ_DEFAULT_PASS: password
+        volumes:
+            - rabbitmq_data:/var/lib/rabbitmq
+        networks:
+            - nanometrics-network
+        healthcheck:
+            test: rabbitmq-diagnostics -q ping
+            interval: 30s
+            timeout: 30s
+            retries: 3
+
+    # MongoDB Database
+    mongodb:
+        image: mongo:7.0
+        container_name: nanometrics-mongodb
+        ports:
+            - "27017:27017"
+        volumes:
+            - mongodb_data:/data/db
+        networks:
+            - nanometrics-network
+        healthcheck:
+            test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+            interval: 30s
+            timeout: 30s
+            retries: 3
+
+    # Producer Service
+    producer:
+        build:
+            context: ./services/producer-service
+            dockerfile: Dockerfile
+        container_name: nanometrics-producer
+        ports:
+            - "8082:8082"
+        environment:
+            PORT: 8082
+            RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
+            RABBITMQ_EXCHANGE: analytics_exchange
+            RABBITMQ_QUEUE: analytics_events
+            RABBITMQ_ROUTING_KEY: analytics.events
+            ALLOWED_ORIGINS: http://localhost:3000,http://localhost:3001
+            ANONYMIZE_IP: "true"
+            STORE_LOCATION: "true"
+            RATE_LIMIT_WINDOW_MS: 60000
+            RATE_LIMIT_MAX_REQUESTS: 1000
+        depends_on:
+            rabbitmq:
+                condition: service_healthy
+        networks:
+            - nanometrics-network
+        restart: unless-stopped
+
+    # Consumer Service
+    consumer:
+        build:
+            context: ./services/consumer-service
+            dockerfile: Dockerfile
+        container_name: nanometrics-consumer
+        ports:
+            - "8083:8083"
+        environment:
+            PORT: 8083
+            RABBITMQ_URL: amqp://admin:password@rabbitmq:5672
+            RABBITMQ_EXCHANGE: analytics_exchange
+            RABBITMQ_QUEUE: analytics_events
+            RABBITMQ_ROUTING_KEY: analytics.events
+            MONGODB_URI: mongodb://mongodb:27017/nanometrics
+            MONGODB_DB_NAME: nanometrics
+            CONSUMER_PREFETCH_COUNT: 10
+            CONSUMER_AUTO_ACK: "false"
+            RETRY_ATTEMPTS: 3
+            RETRY_DELAY_MS: 5000
+        depends_on:
+            rabbitmq:
+                condition: service_healthy
+            mongodb:
+                condition: service_healthy
+        networks:
+            - nanometrics-network
+        restart: unless-stopped
+
+    # Aggregation Service
+    stats-cron-job:
+        build:
+            context: ./services/stats-cron-job
+            dockerfile: Dockerfile
+        container_name: nanometrics-stats-cron-job
+        ports:
+            - "8085:8085"
+        environment:
+            MONGODB_URI: mongodb://admin:password@mongodb:27017/nanometrics?authSource=admin
+            MONGODB_DB_NAME: nanometrics
+            MONGODB_TIMEOUT_SECONDS: 30
+            CRON_SCHEDULE: "*/5 * * * *"
+            AGGREGATION_WINDOW_MINUTES: 5
+            LOG_LEVEL: info
+            LOG_FORMAT: json
+            HEALTH_CHECK_PORT: 8085
+            BATCH_SIZE: 1000
+            MAX_RETRIES: 3
+            RETRY_DELAY_SECONDS: 5
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        networks:
+            - nanometrics-network
+        restart: unless-stopped
+
+    # API Gateway
+    api-gateway:
+        build:
+            context: ./services/api-gateway
+            dockerfile: Dockerfile
+        container_name: nanometrics-api-gateway
+        ports:
+            - "8080:8080"
+        environment:
+            PORT: 8080
+            AUTH_SERVICE_URL: http://auth-service:8081
+            PRODUCER_SERVICE_URL: http://producer:8082
+            CONSUMER_SERVICE_URL: http://consumer:8083
+            STATS_SERVICE_URL: http://stats-service:8084
+        depends_on:
+            - auth-service
+            - producer
+            - consumer
+            - stats-service
+        networks:
+            - nanometrics-network
+        restart: unless-stopped
+
+    # Auth Service
+    auth-service:
+        build:
+            context: ./services/auth-service
+            dockerfile: Dockerfile
+        container_name: nanometrics-auth-service
+        ports:
+            - "8081:8081"
+        environment:
+            PORT: 8081
+            MONGODB_URI: mongodb://admin:password@mongodb:27017/nanometrics?authSource=admin
+            JWT_SECRET: your-super-secret-jwt-key-change-in-production
+            JWT_EXPIRES_IN: 24h
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        networks:
+            - nanometrics-network
+        restart: unless-stopped
+
+    # Stats Service
+    stats-service:
+        build:
+            context: ./services/stats-service
+            dockerfile: Dockerfile
+        container_name: nanometrics-stats-service
+        ports:
+            - "8084:8084"
+        environment:
+            PORT: 8084
+            MONGODB_URI: mongodb://admin:password@mongodb:27017/nanometrics?authSource=admin
+            MONGODB_DB_NAME: nanometrics
+        depends_on:
+            mongodb:
+                condition: service_healthy
+        networks:
+            - nanometrics-network
+        restart: unless-stopped
+
+    # Web Frontend
+    web:
+        build:
+            context: ./web
+            dockerfile: Dockerfile
+        container_name: nanometrics-web
+        ports:
+            - "3000:3000"
+        environment:
+            NEXT_PUBLIC_API_URL: http://localhost:8080
+            NEXT_PUBLIC_ANALYTICS_URL: http://localhost:8082
+        depends_on:
+            - api-gateway
+        networks:
+            - nanometrics-network
+        restart: unless-stopped
+
+volumes:
+    rabbitmq_data:
+        driver: local
+    mongodb_data:
+        driver: local
+
+networks:
+    nanometrics-network:
+        driver: bridge
